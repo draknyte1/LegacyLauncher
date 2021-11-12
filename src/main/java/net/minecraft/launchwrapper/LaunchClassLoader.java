@@ -1,5 +1,6 @@
 package net.minecraft.launchwrapper;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -50,6 +51,8 @@ public class LaunchClassLoader extends URLClassLoader {
 
 	private List<IClassTransformer> transformers = new ArrayList<IClassTransformer>(2);
 	private Map<String, Class<?>> cachedClasses = new ConcurrentHashMap<String, Class<?>>();
+	private List<IResourceTransformer> resourceTransformers = new ArrayList<>();
+    private Map<String, byte[]> cachedResources = new ConcurrentHashMap<>();
 	private Set<String> invalidClasses = new HashSet<String>(1000);
 
 	private Set<String> classLoaderExceptions = new HashSet<String>();
@@ -144,9 +147,23 @@ public class LaunchClassLoader extends URLClassLoader {
 				renameTransformer = (IClassNameTransformer) transformer;
 			}
 		} catch (Exception e) {
-			LogWrapper.log(Level.ERROR, "A critical problem occurred registering the transformer class {}", transformerClassName, e);
+			LogWrapper.severe("A critical problem occurred registering the transformer class {}", transformerClassName, e);
 		}
 	}
+	
+	/**
+	 * Registers resource transformer class
+	 *
+	 * @param transformerClassName Fully qualified transformer class name, see {@link Class#getName()}
+	 */
+    public void registerResourceTransformer(String className) {
+        try {
+            IResourceTransformer transformer = (IResourceTransformer) loadClass(className).newInstance();
+            resourceTransformers.add(transformer);
+        } catch (Exception e) {
+        	LogWrapper.severe("A critical problem occurred registering the resource transformer class {}", className, e);
+        }
+    }
 
 	@Override
 	public Class<?> findClass(final String name) throws ClassNotFoundException {
@@ -492,4 +509,24 @@ public class LaunchClassLoader extends URLClassLoader {
 	public void clearNegativeEntries(Set<String> entriesToClear) {
 		negativeResourceCache.removeAll(entriesToClear);
 	}
+
+    @Override
+    public InputStream getResourceAsStream(String name) {
+        if (resourceCache.containsKey(name)) {
+            return new ByteArrayInputStream(resourceCache.get(name));
+        }
+        InputStream stream = super.getResourceAsStream(name);
+        byte[] original = stream == null ? null : this.readFully(stream);
+        byte[] transformed = null;
+        for (IResourceTransformer transformer : resourceTransformers) {
+            if ((transformed = transformer.transform(name, original)) != null) {
+                resourceCache.put(name, transformed);
+            }
+        }
+        if (transformed != null) {
+            return new ByteArrayInputStream(transformed);
+        }
+        return super.getResourceAsStream(name);
+    }
+    
 }
