@@ -21,16 +21,29 @@ import net.minecraft.launchwrapper.protocol.LegacyProtocolURLStreamHandlerFactor
 import net.minecraft.launchwrapper.utils.classpath.Classpath;
 
 public class Launch {
+	
 	private static final String DEFAULT_TWEAK = "net.minecraft.launchwrapper.VanillaTweaker";
+	/**
+     * The game dir of Minecraft.
+     */
 	public static File minecraftHome;
+	/**
+     * The asset dir of Minecraft.
+     */
 	public static File assetsDir;
+	/**
+     * A map that contains information that tweakers can access.
+     */
 	public static Map<String, Object> blackboard;
 
 	public static void main(String[] args) {
 		System.out.println("Loading Debug LaunchWrapper (J9-17 Support & Misc Fixes.)");
 		new Launch().launch(args);
 	}
-
+	
+	/**
+     * The class loader to register transformers to.
+     */
 	public static LaunchClassLoader classLoader;
 
 	private Launch() {
