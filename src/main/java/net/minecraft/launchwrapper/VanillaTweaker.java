@@ -19,6 +19,7 @@ public class VanillaTweaker implements ITweaker {
     @Override
     public String getLaunchTarget() {
         return "net.minecraft.client.Minecraft";
+        //return "net.minecraft.client.main.Main"; // TODO
     }
 
     @Override
