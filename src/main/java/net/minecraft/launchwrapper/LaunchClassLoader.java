@@ -6,18 +6,26 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.Reader;
 import java.net.JarURLConnection;
+import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.net.URLConnection;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.security.CodeSigner;
 import java.security.CodeSource;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -25,15 +33,18 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.jar.Attributes;
-import java.util.jar.Attributes.Name;
-import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
-import java.util.jar.Manifest;
+import java.util.zip.Adler32;
 
 import javax.annotation.Nullable;
 
 import org.apache.logging.log4j.Level;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+
+import net.minecraft.launchwrapper.utils.classes.CachedClassInfo;
+import net.minecraft.launchwrapper.utils.mixin.MixinSupport;
 
 public class LaunchClassLoader extends URLClassLoader {
 
@@ -48,12 +59,16 @@ public class LaunchClassLoader extends URLClassLoader {
 	public static final int BUFFER_SIZE = 1 << 12;
 	private List<URL> sources;
 	private ClassLoader parent = getClass().getClassLoader();
+	private static final Gson GSON = new GsonBuilder().create();
 
 	private List<IClassTransformer> transformers = new ArrayList<IClassTransformer>(2);
 	private Map<String, Class<?>> cachedClasses = new ConcurrentHashMap<String, Class<?>>();
 	private List<IResourceTransformer> resourceTransformers = new ArrayList<>();
-    private Map<String, byte[]> cachedResources = new ConcurrentHashMap<>();
+	private Map<String, byte[]> cachedResources = new ConcurrentHashMap<>();
 	private Set<String> invalidClasses = new HashSet<String>(1000);
+
+	private FileSystem cacheFileSystem;
+	private CachedClassInfo cachedClassInfo;
 
 	private Set<String> classLoaderExceptions = new HashSet<String>();
 	private Set<String> transformerExceptions = new HashSet<String>();
@@ -71,6 +86,7 @@ public class LaunchClassLoader extends URLClassLoader {
 	private static final boolean DEBUG_SAVE = DEBUG && Boolean.parseBoolean(System.getProperty("legacy.debugClassLoadingSave", "false"));
 	private static final Path DUMP_PATH = Paths.get(System.getProperty("legacy.classDumpPath", "./.classloader.out"));
 	private static File tempFolder = null;
+	private boolean isMixinLoaded = false;
 
 	public LaunchClassLoader(URL[] sources) {
 		super(sources, null);
@@ -81,7 +97,7 @@ public class LaunchClassLoader extends URLClassLoader {
 				"java.",
 				"jdk.",
 				"sun.",
-                "com.sun.",
+				"com.sun.",
 				"org.lwjgl.",
 				"org.apache.logging.",
 				"net.minecraft.launchwrapper."
@@ -93,12 +109,15 @@ public class LaunchClassLoader extends URLClassLoader {
 				"javax.",
 				"jdk.",
 				"sun.",
-                "com.sun.",
+				"com.sun.",
 				"argo.",
 				"org.objectweb.asm.",
 				"com.google.common.",
 				"org.bouncycastle."
 				));
+
+		// Init class cache
+		initializeClassCacheSystem();		
 
 		// See: https://github.com/SpongePowered/SpongeCommon/commit/8f284427ca50d445d0fffab4afc8251388ada8e9
 		/*
@@ -113,13 +132,13 @@ public class LaunchClassLoader extends URLClassLoader {
 		 */
 		ClassLoader classLoader = ClassLoader.getSystemClassLoader();
 		if (classLoader != null) {
-            classLoader = classLoader.getParent(); // Launcher.ExtClassLoader
-            if (classLoader instanceof URLClassLoader) {
-                for (URL url : ((URLClassLoader) classLoader).getURLs()) {
-                    addURL(url);
-                }
-            }
-        }
+			classLoader = classLoader.getParent(); // Launcher.ExtClassLoader
+			if (classLoader instanceof URLClassLoader) {
+				for (URL url : ((URLClassLoader) classLoader).getURLs()) {
+					addURL(url);
+				}
+			}
+		}
 		if (DEBUG_SAVE) {
 			int x = 1;
 			tempFolder = new File(Launch.minecraftHome, "CLASSLOADER_TEMP");
@@ -132,10 +151,93 @@ public class LaunchClassLoader extends URLClassLoader {
 			} else {
 				LogWrapper.info("DEBUG_SAVE Enabled, saving all classes to \"%s\"", tempFolder.getAbsolutePath().replace('\\', '/'));
 				if(!tempFolder.mkdirs()) {
-                    LogWrapper.severe("Can't create temp directories!");
-                }
+					LogWrapper.severe("Can't create temp directories!");
+				}
 			}
 		}
+	}
+
+	private void initializeClassCacheSystem() {
+		long startTime = System.nanoTime();
+
+		File classCachesZip = new File(Launch.minecraftHome, "class_cache.zip");
+		Map<String, String> env = new HashMap<String, String>();
+		env.put("create", "true");
+		try {
+			URI classCachesURI = classCachesZip.toURI(); // here
+			URI classCachesZipURI = new URI("jar:" + classCachesURI.getScheme(), classCachesURI.getPath(), null);
+			cacheFileSystem = FileSystems.newFileSystem(classCachesZipURI, env, null);
+		} catch (Throwable t) {
+			if (classCachesZip.exists()) {
+				LogWrapper.severe("Failed to read class caches", t);
+				try {
+					classCachesZip.delete();
+					URI classCachesURI = classCachesZip.toURI(); // here
+					URI classCahcesZipURI = new URI("jar:" + classCachesURI.getScheme(), classCachesURI.getPath(), null);
+					cacheFileSystem = FileSystems.newFileSystem(classCahcesZipURI, env, null);
+				} catch (Exception e) {
+					throw new RuntimeException("Could not create cached_classes.zip", e);
+				}
+			} else {
+				throw t instanceof RuntimeException ? (RuntimeException) t : new RuntimeException("Could not create cached_classes.zip", t);
+			}
+		}
+
+		Path classInfoCacheFile = cacheFileSystem.getPath("cached_class_info.json");
+
+		long result;
+		try {
+			Adler32 adler32 = new Adler32();
+
+			File modsFolder = new File(Launch.minecraftHome, "mods");
+			if (modsFolder.exists()) {
+				for (File modFile : modsFolder.listFiles()) {
+					if (modFile.isFile()) {
+						adler32.update(Files.readAllBytes(modFile.toPath()));
+					}
+				}
+
+				result = adler32.getValue();
+			} else {
+				result = 0;
+			}
+		} catch (IOException e1) {
+			throw new RuntimeException(e1);
+		}
+		long modsHash = result;
+
+		try {
+			if (Files.exists(classInfoCacheFile)) {
+				try (Reader reader = new InputStreamReader(Files.newInputStream(classInfoCacheFile))) {
+					cachedClassInfo = GSON.fromJson(reader, CachedClassInfo.class);
+				}
+
+				if (modsHash != cachedClassInfo.modsHash) {
+					LogWrapper.info("Mods hash changed, creating new cache: " + modsHash + " != " + cachedClassInfo.modsHash);
+					cachedClassInfo = null;
+				}
+			}
+		} catch (Throwable t) {
+			LogWrapper.severe("Failed to read cached_class_info.json", t);
+		}
+
+		if (cachedClassInfo == null) {
+			cachedClassInfo = new CachedClassInfo();
+			cachedClassInfo.modsHash = modsHash;
+		}
+
+		Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+			// TODO: Doesn't always log message, log4j shutdown hook needs to run after this one
+			try {
+				Files.write(classInfoCacheFile, GSON.toJson(cachedClassInfo).getBytes(), StandardOpenOption.CREATE);
+				cacheFileSystem.close();
+				LogWrapper.info("Saved caches successfully");
+			} catch (Throwable t) {
+				LogWrapper.severe("Failed to save caches", t);
+			}
+		}));
+
+		LogWrapper.info("Initialized cache system in {} ns", System.nanoTime() - startTime);
 	}
 
 	/**
@@ -161,29 +263,29 @@ public class LaunchClassLoader extends URLClassLoader {
 	 * @param transformerInstance Instance of pre-existing {@link IClassTransformer}.
 	 */	
 	public void registerTransformer(IClassTransformer transformerInstance) {
-        try {
-            transformers.add(transformerInstance);
+		try {
+			transformers.add(transformerInstance);
 
-            if (transformerInstance instanceof IClassNameTransformer)
-                renameTransformer = (IClassNameTransformer) transformerInstance;
-        } catch (Exception e) {
-        	LogWrapper.severe("A critical problem occurred registering the transformer class {}", transformerInstance.getClass().getName(), e);
-        }
-    }
-	
+			if (transformerInstance instanceof IClassNameTransformer)
+				renameTransformer = (IClassNameTransformer) transformerInstance;
+		} catch (Exception e) {
+			LogWrapper.severe("A critical problem occurred registering the transformer class {}", transformerInstance.getClass().getName(), e);
+		}
+	}
+
 	/**
 	 * Registers resource transformer class
 	 *
 	 * @param transformerClassName Fully qualified transformer class name, see {@link Class#getName()}
 	 */
-    public void registerResourceTransformer(String className) {
-        try {
-            IResourceTransformer transformer = (IResourceTransformer) loadClass(className).newInstance();
-            resourceTransformers.add(transformer);
-        } catch (Exception e) {
-        	LogWrapper.severe("A critical problem occurred registering the resource transformer class {}", className, e);
-        }
-    }
+	public void registerResourceTransformer(String className) {
+		try {
+			IResourceTransformer transformer = (IResourceTransformer) loadClass(className).newInstance();
+			resourceTransformers.add(transformer);
+		} catch (Exception e) {
+			LogWrapper.severe("A critical problem occurred registering the resource transformer class {}", className, e);
+		}
+	}
 
 	@Override
 	public Class<?> findClass(final String name) throws ClassNotFoundException {
@@ -191,13 +293,19 @@ public class LaunchClassLoader extends URLClassLoader {
 			throw new ClassNotFoundException(name);
 		}
 
+		// Check for mixins
+		if (name.equals("org.spongepowered.asm.mixin.transformer.Proxy")) {
+			isMixinLoaded = true;
+		}
+
 		for(final String exception : classLoaderExceptions) {
 			if(name.startsWith(exception))
 				return parent.loadClass(name);
 		}
 
-		if(cachedClasses.containsKey(name))
+		if(cachedClasses.containsKey(name)) {
 			return cachedClasses.get(name);
+		}
 
 		for(final String exception : transformerExceptions) {
 			if(name.startsWith(exception)) {
@@ -212,79 +320,107 @@ public class LaunchClassLoader extends URLClassLoader {
 			}
 		}
 
-		final String transformedName = transformName(name);
-		if(cachedClasses.containsKey(transformedName)) {
-			return cachedClasses.get(transformedName);
-		}
-
-		final String untransformedName = untransformName(name);
-
-		// Get class bytes
-		byte[] classData = getClassBytes(untransformedName);
-
-		byte[] transformedClass = null;
 		try {
-			// Run transformers (running with null class bytes is valid, because transformers may generate classes dynamically)
-			transformedClass = runTransformers(untransformedName, transformedName, classData);
-		} catch (Exception e) {
-			if(DEBUG)
-				LogWrapper.trace("Exception encountered while transformimg class {}", name, e);
-		}
 
-		// If transformer chain provides no class data, mark given class name invalid and throw CNFE
-		if(transformedClass == null) {
-			invalidClasses.add(name);
-			throw new ClassNotFoundException(name);
-		}
-
-		// Save class if requested so
-		if(DEBUG_SAVE) {
-			try {
-				saveTransformedClass(transformedClass, transformedName);
-			} catch(Exception e){
-				LogWrapper.warning("Failed to save class {}", transformedName, e);
-				e.printStackTrace();
+			String transformedName = cachedClassInfo.transformedClassNames.get(name);
+			if (transformedName == null) {
+				transformedName = transformName(name);
+				cachedClassInfo.transformedClassNames.put(name, transformedName);
 			}
-		}
+			String untransformedName = cachedClassInfo.untransformedClassNames.get(name);
+			if (untransformedName == null) {
+				untransformedName = untransformName(name);
+				cachedClassInfo.untransformedClassNames.put(name, untransformedName);
+			}
+			final String fileName = untransformedName.replace('.', '/').concat(".class");
+			URLConnection urlConnection = findCodeSourceConnectionFor(fileName);
 
-		// Define package for class
-		int lastDot = untransformedName.lastIndexOf('.');
-		String packageName = lastDot == -1 ? "" : untransformedName.substring(0, lastDot);
-		String fileName = untransformedName.replace('.', '/').concat(".class");
-		URLConnection urlConnection = findCodeSourceConnectionFor(fileName);
-		CodeSigner[] signers = null;
+			// Get class bytes
+			byte[] untransformedClass = getClassBytes(untransformedName);
 
-		try {
-			if (lastDot > -1 && !untransformedName.startsWith("net.minecraft.") && !untransformedName.startsWith("com.mojang.")) {
+			// Get signers
+			CodeSigner[] signers = null;
+			if (untransformedName.indexOf('.') > -1 && !untransformedName.startsWith("net.minecraft.")) {
 				if (urlConnection instanceof JarURLConnection) {
-					final JarURLConnection jarURLConnection = (JarURLConnection) urlConnection;
-					final JarFile jarFile = jarURLConnection.getJarFile();
-
+					final JarFile jarFile = ((JarURLConnection) urlConnection).getJarFile();
 					if (jarFile != null && jarFile.getManifest() != null) {
-						final Manifest manifest = jarFile.getManifest();
-						final JarEntry entry = jarFile.getJarEntry(fileName);
+						signers = jarFile.getJarEntry(fileName).getCodeSigners();
+					}
+				}
+			}
 
-						Package pkg = getPackage(packageName);
-						getClassBytes(untransformedName);
-						signers = entry.getCodeSigners();
-						if (pkg == null) {
-							definePackage(packageName, manifest, jarURLConnection.getJarFileURL());
-						} else {
-							if (pkg.isSealed() && !pkg.isSealed(jarURLConnection.getJarFileURL())) {
-								LogWrapper.severe("The jar file {} is trying to seal already secured path {}", jarFile.getName(), packageName);
-							} else if (isSealed(packageName, manifest)) {
-								LogWrapper.severe("The jar file {} has a security seal for path {}, but that path is defined and not secure", jarFile.getName(), packageName);
-							}
-						}
+
+			if (untransformedClass == null) {
+				byte[] transformedClass = runTransformers(untransformedName, transformedName, untransformedClass);
+				CodeSource codeSource = urlConnection == null ? null : new CodeSource(urlConnection.getURL(), signers);
+				Class<?> clazz = defineClass(transformedName, transformedClass, 0, transformedClass.length, codeSource);
+				cachedClasses.put(transformedName, clazz);
+				return clazz;
+			}
+
+			// Calculate untransformed class hash
+			Adler32 adler32 = new Adler32();
+			adler32.update(untransformedClass);
+			long untransformedClassHash = adler32.getValue();
+
+			// Try getting the class from cache
+			byte[] transformedClass = null;
+			long transformedClassHash = cachedClassInfo.transformedClassHashes.getOrDefault(untransformedClassHash, 0L);
+
+			if (transformedClassHash != 0) {
+				try {
+					if (transformedClassHash == untransformedClassHash) {
+						transformedClass = untransformedClass;
+					} else {
+						transformedClass = getFromCache(transformedClassHash);
 					}
-				} else {
-					Package pkg = getPackage(packageName);
-					if (pkg == null) {
-						definePackage(packageName, null, null, null, null, null, null, null);
-					} else if (pkg.isSealed()) {
-						URL url = urlConnection != null ? urlConnection.getURL() : null;
-						LogWrapper.severe("The URL {} is defining elements for sealed path {}", url, packageName);
+					if (isMixinLoaded) {
+						MixinSupport.onCachedClassLoad();
 					}
+				} catch (Throwable t) {
+					LogWrapper.severe("Failed to read cached class {}", name, t);
+				}
+			}
+
+			// Transform the class
+			if (transformedClass == null) {			
+				try {
+					// Run transformers (running with null class bytes is valid, because transformers may generate classes dynamically)
+					transformedClass = runTransformers(untransformedName, transformedName, untransformedClass);
+				} catch (Exception e) {
+					if(DEBUG)
+						LogWrapper.trace("Exception encountered while transformimg class {}", name, e);
+				}
+
+				// Calculate transformed class hash
+				adler32.reset();
+				adler32.update(transformedClass);
+				transformedClassHash = adler32.getValue();
+
+				try {
+					// Cache the transformed class
+					if (transformedClassHash != untransformedClassHash) {
+						saveToCache(transformedClassHash, transformedClass);
+					}
+					cachedClassInfo.transformedClassHashes.put(untransformedClassHash, transformedClassHash);
+				} catch (Throwable t) {
+					LogWrapper.severe("Failed to saving class to cache {}", name, t);
+				}
+			}		
+
+			// If transformer chain provides no class data, mark given class name invalid and throw CNFE
+			if(transformedClass == null) {
+				invalidClasses.add(name);
+				throw new ClassNotFoundException(name);
+			}
+
+			// Save class if requested so
+			if(DEBUG_SAVE) {
+				try {
+					saveTransformedClass(transformedClass, transformedName);
+				} catch(Exception e){
+					LogWrapper.warning("Failed to save class {}", transformedName, e);
+					e.printStackTrace();
 				}
 			}
 
@@ -293,7 +429,8 @@ public class LaunchClassLoader extends URLClassLoader {
 			final Class<?> clazz = defineClass(transformedName, transformedClass, 0, transformedClass.length, codeSource);
 			cachedClasses.put(transformedName, clazz);
 			return clazz;
-		} catch (Exception e) {
+		} 
+		catch (Exception e) {
 			invalidClasses.add(name);
 			if (DEBUG) {
 				LogWrapper.trace("Exception encountered attempting classloading of {}", name, e);
@@ -313,14 +450,14 @@ public class LaunchClassLoader extends URLClassLoader {
 
 		if (!outDir.exists()) {
 			if(!outDir.mkdirs()) {
-                LogWrapper.severe("Can't create directories!");
-            }
+				LogWrapper.severe("Can't create directories!");
+			}
 		}
 
 		if (outFile.exists()) {
 			if(!outFile.delete()) {
-                LogWrapper.severe("Can't delete file!");
-            }
+				LogWrapper.severe("Can't delete file!");
+			}
 		}
 
 		try {
@@ -347,22 +484,6 @@ public class LaunchClassLoader extends URLClassLoader {
 		}
 
 		return name;
-	}
-
-	private boolean isSealed(final String path, final Manifest manifest) {
-		Attributes attributes = manifest.getAttributes(path);
-		String sealed = null;
-		if (attributes != null) {
-			sealed = attributes.getValue(Name.SEALED);
-		}
-
-		if (sealed == null) {
-			attributes = manifest.getMainAttributes();
-			if (attributes != null) {
-				sealed = attributes.getValue(Name.SEALED);
-			}
-		}
-		return "true".equalsIgnoreCase(sealed);
 	}
 
 	private URLConnection findCodeSourceConnectionFor(final String name) {
@@ -478,6 +599,30 @@ public class LaunchClassLoader extends URLClassLoader {
 	}
 
 	/**`
+	 * Gets class raw bytes from ClassCache
+	 *
+	 * @param hash Class hash
+	 * @return Class raw bytes, or null if class was not found
+	 */
+	private byte[] getFromCache(long hash) throws IOException {
+		return Files.readAllBytes(cacheFileSystem.getPath(Long.toHexString(hash)));
+	}
+
+	/**`
+	 * Saves class raw bytes to ClassCache
+	 *
+	 * @param hash Class hash
+	 * @param data Class raw bytes
+	 */
+	private void saveToCache(long hash, byte[] data) throws IOException {
+		Path path = cacheFileSystem.getPath(Long.toHexString(hash));
+
+		if (!Files.exists(path)) {
+			Files.write(path, data);
+		}
+	}
+
+	/**`
 	 * Gets class raw bytes
 	 *
 	 * @param name Class name
@@ -532,23 +677,23 @@ public class LaunchClassLoader extends URLClassLoader {
 		negativeResourceCache.removeAll(entriesToClear);
 	}
 
-    @Override
-    public InputStream getResourceAsStream(String name) {
-        if (resourceCache.containsKey(name)) {
-            return new ByteArrayInputStream(resourceCache.get(name));
-        }
-        InputStream stream = super.getResourceAsStream(name);
-        byte[] original = stream == null ? null : this.readFully(stream);
-        byte[] transformed = null;
-        for (IResourceTransformer transformer : resourceTransformers) {
-            if ((transformed = transformer.transform(name, original)) != null) {
-                resourceCache.put(name, transformed);
-            }
-        }
-        if (transformed != null) {
-            return new ByteArrayInputStream(transformed);
-        }
-        return super.getResourceAsStream(name);
-    }
-    
+	@Override
+	public InputStream getResourceAsStream(String name) {
+		if (resourceCache.containsKey(name)) {
+			return new ByteArrayInputStream(resourceCache.get(name));
+		}
+		InputStream stream = super.getResourceAsStream(name);
+		byte[] original = stream == null ? null : this.readFully(stream);
+		byte[] transformed = null;
+		for (IResourceTransformer transformer : resourceTransformers) {
+			if ((transformed = transformer.transform(name, original)) != null) {
+				resourceCache.put(name, transformed);
+			}
+		}
+		if (transformed != null) {
+			return new ByteArrayInputStream(transformed);
+		}
+		return super.getResourceAsStream(name);
+	}
+
 }
