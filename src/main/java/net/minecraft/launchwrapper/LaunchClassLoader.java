@@ -120,20 +120,20 @@ public class LaunchClassLoader extends URLClassLoader {
                 }
             }
         }
-
 		if (DEBUG_SAVE) {
 			int x = 1;
 			tempFolder = new File(Launch.minecraftHome, "CLASSLOADER_TEMP");
 			while (tempFolder.exists() && x <= 10) {
 				tempFolder = new File(Launch.minecraftHome, "CLASSLOADER_TEMP" + x++);
 			}
-
 			if (tempFolder.exists()) {
 				LogWrapper.info("DEBUG_SAVE enabled, but 10 temp directories already exist, clean them and try again.");
 				tempFolder = null;
 			} else {
 				LogWrapper.info("DEBUG_SAVE Enabled, saving all classes to \"%s\"", tempFolder.getAbsolutePath().replace('\\', '/'));
-				tempFolder.mkdirs();
+				if(!tempFolder.mkdirs()) {
+                    LogWrapper.severe("Can't create temp directories!");
+                }
 			}
 		}
 	}
@@ -268,7 +268,7 @@ public class LaunchClassLoader extends URLClassLoader {
 						getClassBytes(untransformedName);
 						signers = entry.getCodeSigners();
 						if (pkg == null) {
-							pkg = definePackage(packageName, manifest, jarURLConnection.getJarFileURL());
+							definePackage(packageName, manifest, jarURLConnection.getJarFileURL());
 						} else {
 							if (pkg.isSealed() && !pkg.isSealed(jarURLConnection.getJarFileURL())) {
 								LogWrapper.severe("The jar file {} is trying to seal already secured path {}", jarFile.getName(), packageName);
@@ -280,7 +280,7 @@ public class LaunchClassLoader extends URLClassLoader {
 				} else {
 					Package pkg = getPackage(packageName);
 					if (pkg == null) {
-						pkg = definePackage(packageName, null, null, null, null, null, null, null);
+						definePackage(packageName, null, null, null, null, null, null, null);
 					} else if (pkg.isSealed()) {
 						URL url = urlConnection != null ? urlConnection.getURL() : null;
 						LogWrapper.severe("The URL {} is defining elements for sealed path {}", url, packageName);
@@ -312,16 +312,19 @@ public class LaunchClassLoader extends URLClassLoader {
 		final File outDir = outFile.getParentFile();
 
 		if (!outDir.exists()) {
-			outDir.mkdirs();
+			if(!outDir.mkdirs()) {
+                LogWrapper.severe("Can't create directories!");
+            }
 		}
 
 		if (outFile.exists()) {
-			outFile.delete();
+			if(!outFile.delete()) {
+                LogWrapper.severe("Can't delete file!");
+            }
 		}
 
 		try {
 			LogWrapper.fine("Saving transformed class \"%s\" to \"%s\"", transformedName, outFile.getAbsolutePath().replace('\\', '/'));
-
 			final OutputStream output = new FileOutputStream(outFile);
 			output.write(data);
 			output.close();
@@ -376,19 +379,19 @@ public class LaunchClassLoader extends URLClassLoader {
 	}
 
 	private byte[] runTransformers(String name, String transformedName, @Nullable byte[] basicClass) {
-		if(DEBUG_FINER)
+		if(DEBUG_FINER) {
 			LogWrapper.finest("Beginning transform of {{} ({})} Start Length: {}", name, transformedName, basicClass != null ? basicClass.length : 0);
+		}
 
 		for (final IClassTransformer transformer : transformers) {
 			final String transName = transformer.getClass().getName();
-
-			if(DEBUG_FINER)
+			if(DEBUG_FINER) {
 				LogWrapper.finest("Before Transformer {{} ({})} {}: {}", name, transformedName, transName, basicClass != null ? basicClass.length : 0);
-
+			}
 			basicClass = transformer.transform(name, transformedName, basicClass);
-
-			if(DEBUG_FINER)
+			if(DEBUG_FINER) {
 				LogWrapper.finest("After  Transformer {{} ({})} {}: {}", name, transformedName, transName, basicClass != null ? basicClass.length : 0);
+			}
 		}
 		return basicClass;
 	}
@@ -407,10 +410,9 @@ public class LaunchClassLoader extends URLClassLoader {
 		try(ByteArrayOutputStream os = new ByteArrayOutputStream(stream.available())) {
 			int readBytes;
 			byte[] buffer = loadBuffer.get();
-
-			while ((readBytes = stream.read(buffer, 0, buffer.length)) != -1)
+			while ((readBytes = stream.read(buffer, 0, buffer.length)) != -1) {
 				os.write(buffer, 0, readBytes);
-
+			}
 			return os.toByteArray();
 		} catch (Throwable t) {
 			LogWrapper.warning("Problem reading stream fully", t);
