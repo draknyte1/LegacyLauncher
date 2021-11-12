@@ -31,7 +31,6 @@ import java.util.jar.Manifest;
 import javax.annotation.Nullable;
 
 import org.apache.logging.log4j.Level;
-import org.apache.logging.log4j.LogManager;
 
 public class LaunchClassLoader extends URLClassLoader {
 
@@ -106,112 +105,140 @@ public class LaunchClassLoader extends URLClassLoader {
 		}
 	}
 
-	public void registerTransformer(String transformerClassName) {
-		try {
-			IClassTransformer transformer = (IClassTransformer) loadClass(transformerClassName).newInstance();
-			transformers.add(transformer);
-			if (transformer instanceof IClassNameTransformer && renameTransformer == null) {
-				renameTransformer = (IClassNameTransformer) transformer;
-			}
-		} catch (Exception e) {
-			LogWrapper.log(Level.ERROR, e, "A critical problem occurred registering the transformer class %s", transformerClassName);
-		}
-	}
+    /**
+     * Registers transformer class
+     *
+     * @param transformerClassName Fully qualified transformer class name, see {@link Class#getName()}
+     */
+    public void registerTransformer( String transformerClassName) {
+        try {
+            IClassTransformer transformer = (IClassTransformer) loadClass(transformerClassName).newInstance();
+            transformers.add(transformer);
+            if (transformer instanceof IClassNameTransformer && renameTransformer == null) {
+            	renameTransformer = (IClassNameTransformer) transformer;
+            }
+        } catch (Exception e) {
+        	LogWrapper.log(Level.ERROR, "A critical problem occurred registering the transformer class {}", transformerClassName, e);
+        }
+    }
 
 	@Override
 	public Class<?> findClass(final String name) throws ClassNotFoundException {
-		if (invalidClasses.contains(name)) {
-			throw new ClassNotFoundException(name);
-		}
+        if(invalidClasses.contains(name)) {
+            throw new ClassNotFoundException(name);
+        }
 
-		for (final String exception : classLoaderExceptions) {
-			if (name.startsWith(exception)) {
-				return parent.loadClass(name);
-			}
-		}
+        for(final String exception : classLoaderExceptions) {
+            if(name.startsWith(exception))
+                return parent.loadClass(name);
+        }
 
-		if (cachedClasses.containsKey(name)) {
-			return cachedClasses.get(name);
-		}
+        if(cachedClasses.containsKey(name))
+            return cachedClasses.get(name);
 
-		for (final String exception : transformerExceptions) {
-			if (name.startsWith(exception)) {
-				try {
-					final Class<?> clazz = super.findClass(name);
-					cachedClasses.put(name, clazz);
-					return clazz;
-				} catch (ClassNotFoundException e) {
-					invalidClasses.add(name);
-					throw e;
-				}
-			}
-		}
+        for(final String exception : transformerExceptions) {
+            if(name.startsWith(exception)) {
+                try {
+                    final Class<?> clazz = super.findClass(name);
+                    cachedClasses.put(name, clazz);
+                    return clazz;
+                } catch (ClassNotFoundException e) {
+                    invalidClasses.add(name);
+                    throw e;
+                }
+            }
+        }
 
-		try {
-			final String transformedName = transformName(name);
-			if (cachedClasses.containsKey(transformedName)) {
-				return cachedClasses.get(transformedName);
-			}
+        final String transformedName = transformName(name);
+        if(cachedClasses.containsKey(transformedName)) {
+            return cachedClasses.get(transformedName);
+        }
 
-			final String untransformedName = untransformName(name);
+        final String untransformedName = untransformName(name);
 
-			final int lastDot = untransformedName.lastIndexOf('.');
-			final String packageName = lastDot == -1 ? "" : untransformedName.substring(0, lastDot);
-			final String fileName = untransformedName.replace('.', '/').concat(".class");
-			URLConnection urlConnection = findCodeSourceConnectionFor(fileName);
+        // Get class bytes
+        byte[] classData = getClassBytes(untransformedName);
 
-			CodeSigner[] signers = null;
+        byte[] transformedClass = null;
+        try {
+            // Run transformers (running with null class bytes is valid, because transformers may generate classes dynamically)
+            transformedClass = runTransformers(untransformedName, transformedName, classData);
+        } catch (Exception e) {
+            if(DEBUG)
+                LogWrapper.trace("Exception encountered while transformimg class {}", name, e);
+        }
 
-			if (lastDot > -1 && !untransformedName.startsWith("net.minecraft.")) {
-				if (urlConnection instanceof JarURLConnection) {
-					final JarURLConnection jarURLConnection = (JarURLConnection) urlConnection;
-					final JarFile jarFile = jarURLConnection.getJarFile();
+        // If transformer chain provides no class data, mark given class name invalid and throw CNFE
+        if(transformedClass == null) {
+            invalidClasses.add(name);
+            throw new ClassNotFoundException(name);
+        }
 
-					if (jarFile != null && jarFile.getManifest() != null) {
-						final Manifest manifest = jarFile.getManifest();
-						final JarEntry entry = jarFile.getJarEntry(fileName);
+        // Save class if requested so
+        if(DEBUG_SAVE) {
+            try {
+                saveTransformedClass(transformedClass, transformedName);
+            } catch(Exception e){
+            	LogWrapper.warning("Failed to save class {}", transformedName, e);
+                e.printStackTrace();
+            }
+        }
 
-						Package pkg = getPackage(packageName);
-						getClassBytes(untransformedName);
-						signers = entry.getCodeSigners();
-						if (pkg == null) {
-							pkg = definePackage(packageName, manifest, jarURLConnection.getJarFileURL());
-						} else {
-							if (pkg.isSealed() && !pkg.isSealed(jarURLConnection.getJarFileURL())) {
-								LogWrapper.severe("The jar file %s is trying to seal already secured path %s", jarFile.getName(), packageName);
-							} else if (isSealed(packageName, manifest)) {
-								LogWrapper.severe("The jar file %s has a security seal for path %s, but that path is defined and not secure", jarFile.getName(), packageName);
-							}
-						}
-					}
-				} else {
-					Package pkg = getPackage(packageName);
-					if (pkg == null) {
-						pkg = definePackage(packageName, null, null, null, null, null, null, null);
-					} else if (pkg.isSealed()) {
-						LogWrapper.severe("The URL %s is defining elements for sealed path %s", urlConnection.getURL(), packageName);
-					}
-				}
-			}
+        // Define package for class
+        int lastDot = untransformedName.lastIndexOf('.');
+        String packageName = lastDot == -1 ? "" : untransformedName.substring(0, lastDot);
+        String fileName = untransformedName.replace('.', '/').concat(".class");
+        URLConnection urlConnection = findCodeSourceConnectionFor(fileName);
+        CodeSigner[] signers = null;
 
-			final byte[] transformedClass = runTransformers(untransformedName, transformedName, getClassBytes(untransformedName));
-			if (DEBUG_SAVE) {
-				saveTransformedClass(transformedClass, transformedName);
-			}
+        try {
+            if (lastDot > -1 && !untransformedName.startsWith("net.minecraft.")) {
+                if (urlConnection instanceof JarURLConnection) {
+                    final JarURLConnection jarURLConnection = (JarURLConnection) urlConnection;
+                    final JarFile jarFile = jarURLConnection.getJarFile();
 
-			final CodeSource codeSource = urlConnection == null ? null : new CodeSource(urlConnection.getURL(), signers);
-			final Class<?> clazz = defineClass(transformedName, transformedClass, 0, transformedClass.length, codeSource);
-			cachedClasses.put(transformedName, clazz);
-			return clazz;
-		} catch (Throwable e) {
-			invalidClasses.add(name);
-			if (DEBUG) {
-				LogWrapper.log(Level.TRACE, e, "Exception encountered attempting classloading of %s", name);
-				LogManager.getLogger("LaunchWrapper").log(Level.ERROR, String.format("Exception encountered attempting classloading of " + name, name), e);
-			}
-			throw new ClassNotFoundException(name, e);
-		}
-	}
+                    if (jarFile != null && jarFile.getManifest() != null) {
+                        final Manifest manifest = jarFile.getManifest();
+                        final JarEntry entry = jarFile.getJarEntry(fileName);
+
+                        Package pkg = getPackage(packageName);
+                        getClassBytes(untransformedName);
+                        signers = entry.getCodeSigners();
+                        if (pkg == null) {
+                            pkg = definePackage(packageName, manifest, jarURLConnection.getJarFileURL());
+                        } else {
+                            if (pkg.isSealed() && !pkg.isSealed(jarURLConnection.getJarFileURL())) {
+                            	LogWrapper.severe("The jar file {} is trying to seal already secured path {}", jarFile.getName(), packageName);
+                            } else if (isSealed(packageName, manifest)) {
+                            	LogWrapper.severe("The jar file {} has a security seal for path {}, but that path is defined and not secure", jarFile.getName(), packageName);
+                            }
+                        }
+                    }
+                } else {
+                    Package pkg = getPackage(packageName);
+                    if (pkg == null) {
+                        pkg = definePackage(packageName, null, null, null, null, null, null, null);
+                    } else if (pkg.isSealed()) {
+                        URL url = urlConnection != null ? urlConnection.getURL() : null;
+                        LogWrapper.severe("The URL {} is defining elements for sealed path {}", url, packageName);
+                    }
+                }
+            }
+
+            // Define class
+            final CodeSource codeSource = urlConnection == null ? null : new CodeSource(urlConnection.getURL(), signers);
+            final Class<?> clazz = defineClass(transformedName, transformedClass, 0, transformedClass.length, codeSource);
+            cachedClasses.put(transformedName, clazz);
+            return clazz;
+        } catch (Exception e) {
+            invalidClasses.add(name);
+            if (DEBUG) {
+            	LogWrapper.trace("Exception encountered attempting classloading of {}", name, e);
+            }
+            throw new ClassNotFoundException(name, e);
+        }
+    }
+
 
 	private void saveTransformedClass(final byte[] data, final String transformedName) {
 		if (tempFolder == null || transformedName == null || data == null) {
@@ -284,24 +311,24 @@ public class LaunchClassLoader extends URLClassLoader {
 
 		return null;
 	}
+	
+	private byte[] runTransformers(String name, String transformedName, @Nullable byte[] basicClass) {
+        if(DEBUG_FINER)
+        	LogWrapper.finest("Beginning transform of {{} ({})} Start Length: {}", name, transformedName, basicClass != null ? basicClass.length : 0);
 
-	private byte[] runTransformers(final String name, final String transformedName, byte[] basicClass) {
-		if (DEBUG_FINER) {
-			LogWrapper.finest("Beginning transform of {%s (%s)} Start Length: %d", name, transformedName, (basicClass == null ? 0 : basicClass.length));
-			for (final IClassTransformer transformer : transformers) {
-				final String transName = transformer.getClass().getName();
-				LogWrapper.finest("Before Transformer {%s (%s)} %s: %d", name, transformedName, transName, (basicClass == null ? 0 : basicClass.length));
-				basicClass = transformer.transform(name, transformedName, basicClass);
-				LogWrapper.finest("After  Transformer {%s (%s)} %s: %d", name, transformedName, transName, (basicClass == null ? 0 : basicClass.length));
-			}
-			LogWrapper.finest("Ending transform of {%s (%s)} Start Length: %d", name, transformedName, (basicClass == null ? 0 : basicClass.length));
-		} else {
-			for (final IClassTransformer transformer : transformers) {
-				basicClass = transformer.transform(name, transformedName, basicClass);
-			}
-		}
-		return basicClass;
-	}
+        for (final IClassTransformer transformer : transformers) {
+            final String transName = transformer.getClass().getName();
+
+            if(DEBUG_FINER)
+            	LogWrapper.finest("Before Transformer {{} ({})} {}: {}", name, transformedName, transName, basicClass != null ? basicClass.length : 0);
+
+            basicClass = transformer.transform(name, transformedName, basicClass);
+
+            if(DEBUG_FINER)
+            	LogWrapper.finest("After  Transformer {{} ({})} {}: {}", name, transformedName, transName, basicClass != null ? basicClass.length : 0);
+        }
+        return basicClass;
+    }
 
 	@Override
 	public void addURL(final URL url) {
