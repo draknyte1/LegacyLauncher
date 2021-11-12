@@ -141,7 +141,7 @@ public class LaunchClassLoader extends URLClassLoader {
 	/**
 	 * Registers transformer class
 	 *
-	 * @param transformerClassName Fully qualified transformer class name, see {@link Class#getName()}
+	 * @param transformerClassName Fully qualified transformer class name, see {@link Class#getName()}.
 	 */
 	public void registerTransformer( String transformerClassName) {
 		try {
@@ -154,6 +154,22 @@ public class LaunchClassLoader extends URLClassLoader {
 			LogWrapper.severe("A critical problem occurred registering the transformer class {}", transformerClassName, e);
 		}
 	}
+
+	/**
+	 * Registers transformer class
+	 *
+	 * @param transformerInstance Instance of pre-existing {@link IClassTransformer}.
+	 */	
+	public void registerTransformer(IClassTransformer transformerInstance) {
+        try {
+            transformers.add(transformerInstance);
+
+            if (transformerInstance instanceof IClassNameTransformer)
+                renameTransformer = (IClassNameTransformer) transformerInstance;
+        } catch (Exception e) {
+        	LogWrapper.severe("A critical problem occurred registering the transformer class {}", transformerInstance.getClass().getName(), e);
+        }
+    }
 	
 	/**
 	 * Registers resource transformer class

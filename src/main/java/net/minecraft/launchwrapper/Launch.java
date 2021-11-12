@@ -132,6 +132,12 @@ public class Launch {
 			for (final ITweaker tweaker : allTweakers) {
 				argumentList.addAll(Arrays.asList(tweaker.getLaunchArguments()));
 			}
+			
+			// Tweak arguments as required.
+			for (final ITweaker tweaker : allTweakers) {
+                if (tweaker instanceof IArgumentTweaker)
+                    ((IArgumentTweaker) tweaker).modifyArguments(argumentList);
+            }
 
 			// Finally we turn to the primary tweaker, and let it tell us where to go to launch
 			final String launchTarget = primaryTweaker.getLaunchTarget();
