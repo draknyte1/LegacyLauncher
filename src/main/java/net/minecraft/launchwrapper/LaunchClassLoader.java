@@ -147,7 +147,7 @@ public class LaunchClassLoader extends URLClassLoader {
 		try {
 			IClassTransformer transformer = (IClassTransformer) loadClass(transformerClassName).newInstance();
 			transformers.add(transformer);
-			if (transformer instanceof IClassNameTransformer && renameTransformer == null) {
+			if (transformer instanceof IClassNameTransformer/* && renameTransformer == null*/) {
 				renameTransformer = (IClassNameTransformer) transformer;
 			}
 		} catch (Exception e) {
